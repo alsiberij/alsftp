@@ -27,8 +27,9 @@ type (
 	}
 
 	connData struct {
-		File    **os.File
-		UdpConn *net.UDPConn
+		UdpConn      *net.UDPConn
+		partsCh      chan dataPartition
+		tcpAckDataCh chan []byte
 	}
 )
 
@@ -78,7 +79,7 @@ func (s *Server) ListenAndServe(port uint16) {
 
 		go tcpReader(reqCh, tcpConn, s.netTimeout, s.needToLogNet, s.serverWg)
 		go tcpWriter(tcpDataCh, tcpConn, s.needToLogNet, s.serverWg)
-		go s.requestHandler(&connData{File: new(*os.File)}, tcpConn, reqCh, tcpDataCh)
+		go s.requestHandler(connData{partsCh: make(chan dataPartition, 1), tcpAckDataCh: make(chan []byte, 1)}, tcpConn, reqCh, tcpDataCh)
 	}
 
 	s.serverWg.Wait()
@@ -108,7 +109,7 @@ func (s *Server) logNetwork(data string) {
 	}
 }
 
-func (s *Server) requestHandler(cd *connData, tcpConn *net.TCPConn, reqCh <-chan request, tcpDataCh chan<- []byte) {
+func (s *Server) requestHandler(cd connData, tcpConn *net.TCPConn, reqCh <-chan request, tcpDataCh chan<- []byte) {
 	defer s.serverWg.Done()
 	defer close(tcpDataCh)
 
@@ -132,21 +133,20 @@ func (s *Server) requestHandler(cd *connData, tcpConn *net.TCPConn, reqCh <-chan
 
 			udpConn, err = s.requestOpenConnection(req)
 			if err == nil {
+				if cd.UdpConn != nil {
+					_ = cd.UdpConn.Close()
+				}
 				cd.UdpConn = udpConn
-				dataPartitionsCh := make(chan dataPartition, 1)
-				tcpDataCh2 := make(chan []byte, 1)
 
 				s.serverWg.Add(1)
 
-				go tcpWriter(tcpDataCh2, tcpConn, s.needToLogNet, s.serverWg)
+				go tcpWriter(cd.tcpAckDataCh, tcpConn, s.needToLogNet, s.serverWg)
+				go udpReader(cd.partsCh, udpConn, tcpConn, s.netTimeout, s.needToLogNet)
 
-				go udpReader(dataPartitionsCh, udpConn, tcpConn, s.netTimeout, s.needToLogNet)
-				go s.filePartsHandler(tcpConn, cd.File, dataPartitionsCh, tcpDataCh2)
-
-				go func(ch chan struct{}, udpConn *net.UDPConn) {
-					<-ch
+				go func(udpConn *net.UDPConn, sigCh <-chan struct{}) {
+					<-sigCh
 					_ = udpConn.Close()
-				}(closeSigCh, udpConn)
+				}(udpConn, closeSigCh)
 			}
 		case opSaveFilename:
 			response[0] = ackSaveFilename
@@ -154,18 +154,15 @@ func (s *Server) requestHandler(cd *connData, tcpConn *net.TCPConn, reqCh <-chan
 
 			f, err = s.requestSaveFilename(req)
 			if err == nil {
-				*cd.File = f
+				go s.filePartsHandler(tcpConn, f, cd.partsCh, cd.tcpAckDataCh)
 			}
-
-			go func(ch chan struct{}, file *os.File) {
-				<-ch
-				_ = file.Close()
-			}(closeSigCh, f)
 		case opEOF:
 			response[0] = ackEOF
 
-			closeIgnoreError(cd.UdpConn)
-			err = s.requestEOF(req, cd.File)
+			err = s.requestEOF(req)
+			if err == nil && cd.UdpConn != nil {
+				_ = cd.UdpConn.Close()
+			}
 		case opDownload:
 			response[0] = ackEOF
 			err = s.download(req.Content, tcpDataCh)
@@ -215,20 +212,11 @@ func (s *Server) requestSaveFilename(req request) (*os.File, error) {
 	return f, nil
 }
 
-func (s *Server) requestEOF(req request, f **os.File) error {
+func (s *Server) requestEOF(req request) error {
 	s.logServing("SAVE FILE...")
 
 	if len(req.Content) != 0 {
 		return errors.New("UNEXPECTED BODY")
-	}
-
-	if *f == nil {
-		return errors.New("NO FILE TO SAVE")
-	}
-
-	err := (*f).Close()
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -268,17 +256,14 @@ func (s *Server) download(filename []byte, tcpDataCh chan<- []byte) error {
 	return nil
 }
 
-func (s *Server) filePartsHandler(tcpConn *net.TCPConn, f **os.File, dataPartitionsCh <-chan dataPartition, tcpDataCh chan<- []byte) {
+func (s *Server) filePartsHandler(tcpConn *net.TCPConn, f *os.File, dataPartitionsCh <-chan dataPartition, tcpDataCh chan<- []byte) {
 	defer close(tcpDataCh)
+	defer closeIgnoreError(f)
 
 	defer s.logServing(fmt.Sprintf("FIL [%p] H --->> CLOSED", tcpConn))
 
 	for partition := range dataPartitionsCh {
 		s.logServing("SAVE FILE PART...")
-
-		if *f == nil {
-			return
-		}
 
 		acknowledgment := make([]byte, 1+int16Bytes+int64Bytes+1)
 		acknowledgment[0] = ackFilePart
@@ -289,7 +274,7 @@ func (s *Server) filePartsHandler(tcpConn *net.TCPConn, f **os.File, dataPartiti
 			acknowledgment[1+int16Bytes+int64Bytes] = 0xE0
 		}
 
-		_, err := (*f).Write(partition.Content)
+		_, err := f.Write(partition.Content)
 		if err != nil {
 			s.logServing(fmt.Sprintf("ERROR: %v", err))
 			acknowledgment[1+int16Bytes+int64Bytes] = 0xE1
